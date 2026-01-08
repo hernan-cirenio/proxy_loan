@@ -1,12 +1,13 @@
 import csv
 import os
-import sqlite3
 import tempfile
 from datetime import datetime, date
+from urllib.parse import urlparse, parse_qs
 
 import boto3
+import pymysql
 
-DB_PATH = os.environ.get("DB_PATH", "./data/app.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 DO_SPACES_ENDPOINT = os.environ.get("DO_SPACES_ENDPOINT")
 DO_SPACES_BUCKET = os.environ.get("DO_SPACES_BUCKET")
 DO_SPACES_KEY = os.environ.get("DO_SPACES_KEY")
@@ -14,6 +15,61 @@ DO_SPACES_SECRET = os.environ.get("DO_SPACES_SECRET")
 DO_SPACES_REGION = os.environ.get("DO_SPACES_REGION", "us-east-1")
 LOCAL_STORAGE = os.environ.get("LOCAL_STORAGE", "false").lower() == "true"
 LOCAL_STORAGE_DIR = os.environ.get("LOCAL_STORAGE_DIR", "/data/uploads")
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "20"))
+RUN_ONCE = os.environ.get("RUN_ONCE", "false").lower() == "true"
+
+
+def _get_mysql_ssl():
+    mode = str(os.environ.get("DB_SSL_MODE", "REQUIRED")).upper()
+    if mode == "DISABLED":
+        return None
+
+    ca_path = os.environ.get("DB_SSL_CA_PATH")
+    ca_b64 = os.environ.get("DB_SSL_CA_BASE64")
+    if ca_path and os.path.exists(ca_path):
+        return {"ca": ca_path}
+
+    if ca_b64:
+        # Write CA to a temp file (PyMySQL expects a file path)
+        import base64
+
+        ca_bytes = base64.b64decode(ca_b64)
+        tmp_path = os.path.join(tempfile.gettempdir(), "db-ca.pem")
+        with open(tmp_path, "wb") as f:
+            f.write(ca_bytes)
+        return {"ca": tmp_path}
+
+    # Fallback: TLS without CA verification (not ideal; prefer setting CA)
+    return {"check_hostname": False}
+
+
+def connect_mysql():
+    if not DATABASE_URL:
+        raise SystemExit("Missing DATABASE_URL for MySQL connection")
+
+    parsed = urlparse(DATABASE_URL)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("mysql", "mysql2"):
+        raise SystemExit("DATABASE_URL must start with mysql://")
+
+    db_name = (parsed.path or "").lstrip("/")
+    if not db_name:
+        raise SystemExit("DATABASE_URL is missing database name")
+
+    qs = parse_qs(parsed.query or "")
+    charset = (qs.get("charset", ["utf8mb4"])[0]) or "utf8mb4"
+
+    return pymysql.connect(
+        host=parsed.hostname,
+        user=parsed.username,
+        password=parsed.password,
+        database=db_name,
+        port=parsed.port or 3306,
+        autocommit=False,
+        charset=charset,
+        cursorclass=pymysql.cursors.DictCursor,
+        ssl=_get_mysql_ssl(),
+    )
 
 
 def parse_decimal(value):
@@ -213,7 +269,8 @@ def build_metrics(detalle_data, convenio_data):
 
 def process_job(conn, job):
     job_id, detalle_key, convenios_key = job
-    conn.execute("UPDATE jobs SET status = ? WHERE id = ?", ("processing", job_id))
+    with conn.cursor() as cur:
+        cur.execute("UPDATE jobs SET status = %s WHERE id = %s", ("processing", job_id))
     conn.commit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -242,63 +299,133 @@ def process_job(conn, job):
         convenio_data = parse_convenios(convenios_path)
         metrics = build_metrics(detalle_data, convenio_data)
 
-        conn.execute("DELETE FROM cuil_metrics")
-        now = datetime.utcnow().isoformat()
+        now = datetime.utcnow()
+        rows = [
+            (
+                cuil,
+                values.get("deuda_a_vencer_total_vigente", 0.0),
+                values.get("suma_cuotas_prestamo_vigente", 0.0),
+                values.get("suma_cuotas_prestamo_mes_1", 0.0),
+                values.get("suma_cuotas_prestamo_mes_2", 0.0),
+                values.get("tiene_refinanciacion_vigente", "NO"),
+                values.get("tiene_refinanciacion_ultimos_6_meses", "NO"),
+                values.get("dias_atraso_vigente", 0),
+                values.get("fec_ult_pago"),
+                values.get("fec_ult_prestamo"),
+                now,
+            )
+            for cuil, values in metrics.items()
+        ]
+
         insert_sql = (
             "INSERT INTO cuil_metrics (cuil, deuda_a_vencer_total_vigente, suma_cuotas_prestamo_vigente, "
             "suma_cuotas_prestamo_mes_1, suma_cuotas_prestamo_mes_2, "
             "tiene_refinanciacion_vigente, tiene_refinanciacion_ultimos_6_meses, "
             "dias_atraso_vigente, fec_ult_pago, fec_ult_prestamo, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
         )
 
-        for cuil, values in metrics.items():
-            conn.execute(
-                insert_sql,
-                (
-                    cuil,
-                    values["deuda_a_vencer_total_vigente"],
-                    values["suma_cuotas_prestamo_vigente"],
-                    values["suma_cuotas_prestamo_mes_1"],
-                    values["suma_cuotas_prestamo_mes_2"],
-                    values["tiene_refinanciacion_vigente"],
-                    values["tiene_refinanciacion_ultimos_6_meses"],
-                    values["dias_atraso_vigente"],
-                    values["fec_ult_pago"],
-                    values["fec_ult_prestamo"],
-                    now,
-                ),
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM cuil_metrics")
+            # Insert in chunks to avoid oversized packets
+            chunk_size = int(os.environ.get("DB_INSERT_CHUNK", "2000"))
+            for i in range(0, len(rows), chunk_size):
+                cur.executemany(insert_sql, rows[i : i + chunk_size])
+
+            cur.execute(
+                "UPDATE jobs SET status = %s, message = %s WHERE id = %s",
+                ("completed", f"{len(metrics)} CUILs", job_id),
             )
-
-        conn.execute(
-            "UPDATE jobs SET status = ?, message = ? WHERE id = ?",
-            ("completed", f"{len(metrics)} CUILs", job_id),
-        )
         conn.commit()
+
+
+def ensure_schema(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+              created_at DATETIME(6) NOT NULL,
+              status VARCHAR(64) NOT NULL,
+              message TEXT NULL,
+              detalle_key TEXT NULL,
+              convenios_key TEXT NULL,
+              detalle_name TEXT NULL,
+              convenios_name TEXT NULL,
+              PRIMARY KEY (id),
+              INDEX idx_jobs_status (status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cuil_metrics (
+              cuil VARCHAR(32) NOT NULL,
+              deuda_a_vencer_total_vigente DOUBLE NULL,
+              suma_cuotas_prestamo_vigente DOUBLE NULL,
+              suma_cuotas_prestamo_mes_1 DOUBLE NULL,
+              suma_cuotas_prestamo_mes_2 DOUBLE NULL,
+              tiene_refinanciacion_vigente VARCHAR(8) NULL,
+              tiene_refinanciacion_ultimos_6_meses VARCHAR(8) NULL,
+              dias_atraso_vigente INT NULL,
+              fec_ult_pago DATE NULL,
+              fec_ult_prestamo DATE NULL,
+              updated_at DATETIME(6) NOT NULL,
+              PRIMARY KEY (cuil),
+              INDEX idx_metrics_updated_at (updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+
+
+def run_pending_jobs(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, detalle_key, convenios_key FROM jobs WHERE status = 'uploaded' ORDER BY id")
+        jobs = cur.fetchall()
+
+    for job in jobs:
+        try:
+            process_job(conn, (job["id"], job["detalle_key"], job["convenios_key"]))
+        except Exception as exc:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE jobs SET status = %s, message = %s WHERE id = %s",
+                    ("failed", str(exc), job["id"]),
+                )
+            conn.commit()
+
+    return len(jobs)
 
 
 def main():
     if not LOCAL_STORAGE and not all([DO_SPACES_ENDPOINT, DO_SPACES_BUCKET, DO_SPACES_KEY, DO_SPACES_SECRET]):
         raise SystemExit("Missing DO Spaces configuration")
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if RUN_ONCE:
+        conn = connect_mysql()
+        ensure_schema(conn)
+        conn.commit()
+        run_pending_jobs(conn)
+        conn.close()
+        return
 
-    jobs = conn.execute(
-        "SELECT id, detalle_key, convenios_key FROM jobs WHERE status = 'uploaded' ORDER BY id"
-    ).fetchall()
+    # Long-running worker loop (for App Platform "Worker" component)
+    import time
 
-    for job in jobs:
+    while True:
         try:
-            process_job(conn, (job["id"], job["detalle_key"], job["convenios_key"]))
-        except Exception as exc:
-            conn.execute(
-                "UPDATE jobs SET status = ?, message = ? WHERE id = ?",
-                ("failed", str(exc), job["id"]),
-            )
+            conn = connect_mysql()
+            ensure_schema(conn)
             conn.commit()
+            processed = run_pending_jobs(conn)
+            conn.close()
 
-    conn.close()
+            # If we processed something, immediately check again; otherwise wait.
+            if processed == 0:
+                time.sleep(max(POLL_INTERVAL_SECONDS, 1))
+        except Exception as exc:
+            print(f"Worker loop error: {exc}")
+            time.sleep(max(POLL_INTERVAL_SECONDS, 1))
 
 
 if __name__ == "__main__":

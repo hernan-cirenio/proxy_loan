@@ -21,6 +21,12 @@ Modulo para importar CSVs, recalcular variables por CUIL y exponer una API REST.
 2. Levantar servicios: `docker compose up --build`.
 3. UI/API: `http://localhost:3000`.
 
+## Seguridad (API Key)
+- Los endpoints bajo `/api/*` requieren **sesión** (login UI) **o** **API KEY**.
+- Configurar `API_KEY` en `.env`.
+- En Postman enviar:
+  - Header `x-api-key: <API_KEY>` o `Authorization: Bearer <API_KEY>`.
+
 ## Desarrollo local sin DO Spaces
 - Setear `LOCAL_STORAGE=true` y `LOCAL_STORAGE_DIR=./data/uploads` en `.env`.
 - El API guardara los archivos en disco y el worker los lee desde ese directorio.

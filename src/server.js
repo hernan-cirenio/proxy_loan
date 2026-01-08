@@ -5,18 +5,20 @@ import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getDb } from "./db.js";
+import { ensureSchema, getDb } from "./db.js";
 
 const PORT = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET || "change-me";
 const APP_USER = process.env.APP_USER || "admin";
 const APP_PASS = process.env.APP_PASS || "secret";
+const API_KEY = process.env.API_KEY || "";
 
 const DO_SPACES_ENDPOINT = process.env.DO_SPACES_ENDPOINT;
 const DO_SPACES_BUCKET = process.env.DO_SPACES_BUCKET;
 const DO_SPACES_KEY = process.env.DO_SPACES_KEY;
 const DO_SPACES_SECRET = process.env.DO_SPACES_SECRET;
 const DO_SPACES_REGION = process.env.DO_SPACES_REGION || "us-east-1";
+const DO_SPACES_PREFIX = process.env.DO_SPACES_PREFIX || "";
 const LOCAL_STORAGE = process.env.LOCAL_STORAGE === "true";
 const LOCAL_STORAGE_DIR = process.env.LOCAL_STORAGE_DIR || "data/uploads";
 const INLINE_PROCESS = process.env.INLINE_PROCESS === "true";
@@ -24,8 +26,31 @@ const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
 
 const app = express();
 const db = getDb();
+await ensureSchema(db);
 
 const upload = multer({ dest: LOCAL_STORAGE_DIR });
+
+function requireApiAuth(req, res, next) {
+  // Allow authenticated UI sessions to use /api/* without exposing the API key to the browser.
+  if (req.session?.user === true) {
+    return next();
+  }
+
+  if (!API_KEY) {
+    return res.status(401).json({ error: "API_KEY no configurada" });
+  }
+
+  const headerKey = req.get("x-api-key");
+  const authHeader = req.get("authorization") || "";
+  const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
+  const provided = headerKey || bearer;
+
+  if (provided && provided === API_KEY) {
+    return next();
+  }
+
+  return res.status(401).json({ error: "API key inválida" });
+}
 
 function createS3Client() {
   if (!DO_SPACES_ENDPOINT || !DO_SPACES_BUCKET || !DO_SPACES_KEY || !DO_SPACES_SECRET) {
@@ -234,6 +259,9 @@ function requireAuth(req, res, next) {
   return res.redirect("/login");
 }
 
+// Protect all API endpoints via session or API key.
+app.use("/api", requireApiAuth);
+
 app.get("/login", (req, res) => {
   if (req.session?.user === true) {
     return res.redirect("/");
@@ -257,11 +285,18 @@ app.post("/logout", (req, res) => {
 });
 
 app.get("/", requireAuth, (req, res) => {
-  const jobs = db
-    .prepare("SELECT * FROM jobs ORDER BY id DESC LIMIT 5")
-    .all();
-  const message = req.query.message === "ok" ? "Archivos recibidos. El job queda en cola." : null;
-  res.send(renderDashboard({ jobs, message }));
+  (async () => {
+    const [rows] = await db.query("SELECT * FROM jobs ORDER BY id DESC LIMIT 5");
+    const jobs = rows.map((r) => ({
+      ...r,
+      created_at: r.created_at ? new Date(r.created_at).toISOString() : null
+    }));
+    const message = req.query.message === "ok" ? "Archivos recibidos. El job queda en cola." : null;
+    res.send(renderDashboard({ jobs, message }));
+  })().catch((err) => {
+    console.error(err);
+    res.status(500).send("Error cargando dashboard");
+  });
 });
 
 app.post(
@@ -282,17 +317,25 @@ app.post(
       return res.status(400).send(renderDashboard({ jobs, message: "Faltan archivos" }));
     }
 
-    const now = new Date().toISOString();
-    const insertJob = db.prepare(
-      "INSERT INTO jobs (created_at, status, detalle_name, convenios_name) VALUES (?, ?, ?, ?)"
+    const now = new Date();
+    const [insertRes] = await db.query(
+      "INSERT INTO jobs (created_at, status, detalle_name, convenios_name) VALUES (?, ?, ?, ?)",
+      [now, "pending_upload", detalleFile.originalname, conveniosFile.originalname]
     );
-    const result = insertJob.run(now, "pending_upload", detalleFile.originalname, conveniosFile.originalname);
-    const jobId = result.lastInsertRowid;
+    const jobId = insertRes.insertId;
 
     try {
+      const prefix = String(DO_SPACES_PREFIX || "")
+        .replace(/\\/g, "/")
+        .replace(/^\/+|\/+$/g, "")
+        .split("/")
+        .filter((p) => p && p !== "." && p !== "..")
+        .join("/");
+      const keyBase = prefix ? `${prefix}/` : "";
+
       if (LOCAL_STORAGE) {
-        const detalleKey = path.join("imports", String(jobId), "detalle.csv");
-        const conveniosKey = path.join("imports", String(jobId), "convenios.csv");
+        const detalleKey = path.join(keyBase, "imports", String(jobId), "detalle.csv");
+        const conveniosKey = path.join(keyBase, "imports", String(jobId), "convenios.csv");
         const detalleDest = path.join(LOCAL_STORAGE_DIR, detalleKey);
         const conveniosDest = path.join(LOCAL_STORAGE_DIR, conveniosKey);
 
@@ -302,16 +345,16 @@ app.post(
         fs.renameSync(detalleFile.path, detalleDest);
         fs.renameSync(conveniosFile.path, conveniosDest);
 
-        db.prepare("UPDATE jobs SET status = ?, detalle_key = ?, convenios_key = ? WHERE id = ?").run(
+        await db.query("UPDATE jobs SET status = ?, detalle_key = ?, convenios_key = ? WHERE id = ?", [
           "uploaded",
           detalleKey,
           conveniosKey,
           jobId
-        );
+        ]);
       } else {
         const s3 = createS3Client();
-        const detalleKey = `imports/${jobId}/detalle.csv`;
-        const conveniosKey = `imports/${jobId}/convenios.csv`;
+        const detalleKey = `${keyBase}imports/${jobId}/detalle.csv`;
+        const conveniosKey = `${keyBase}imports/${jobId}/convenios.csv`;
 
         await s3.send(
           new PutObjectCommand({
@@ -330,12 +373,12 @@ app.post(
           })
         );
 
-        db.prepare("UPDATE jobs SET status = ?, detalle_key = ?, convenios_key = ? WHERE id = ?").run(
+        await db.query("UPDATE jobs SET status = ?, detalle_key = ?, convenios_key = ? WHERE id = ?", [
           "uploaded",
           detalleKey,
           conveniosKey,
           jobId
-        );
+        ]);
       }
 
       if (INLINE_PROCESS) {
@@ -344,10 +387,12 @@ app.post(
 
       res.redirect("/?message=ok");
     } catch (error) {
-      db.prepare("UPDATE jobs SET status = ?, message = ? WHERE id = ?").run("failed", error.message, jobId);
-      const jobs = db
-        .prepare("SELECT * FROM jobs ORDER BY id DESC LIMIT 5")
-        .all();
+      await db.query("UPDATE jobs SET status = ?, message = ? WHERE id = ?", ["failed", error.message, jobId]);
+      const [rows] = await db.query("SELECT * FROM jobs ORDER BY id DESC LIMIT 5");
+      const jobs = rows.map((r) => ({
+        ...r,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : null
+      }));
       res.status(500).send(renderDashboard({ jobs, message: "Error subiendo archivos" }));
     } finally {
       if (!LOCAL_STORAGE) {
@@ -358,17 +403,19 @@ app.post(
   }
 );
 
-app.get("/api/clientes/:cuil", (req, res) => {
+app.get("/api/clientes/:cuil", async (req, res) => {
   const cuil = String(req.params.cuil || "").trim();
-  const row = db
-    .prepare("SELECT * FROM cuil_metrics WHERE cuil = ?")
-    .get(cuil);
+  const [rows] = await db.query("SELECT * FROM cuil_metrics WHERE cuil = ?", [cuil]);
+  const row = rows[0];
 
   if (!row) {
     return res.status(404).json({ error: "CUIL no encontrado" });
   }
 
-  return res.json(row);
+  return res.json({
+    ...row,
+    updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null
+  });
 });
 
 app.get("/api/health", (req, res) => {
