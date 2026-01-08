@@ -74,6 +74,10 @@ function renderPage(title, body) {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${title}</title>
+    <link rel="apple-touch-icon" sizes="180x180" href="https://www.cirenio.com/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="https://www.cirenio.com/favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="https://www.cirenio.com/favicon-16x16.png" />
+    <link rel="shortcut icon" href="https://www.cirenio.com/favicon-32x32.png" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -160,7 +164,7 @@ function renderDashboard({ jobs, message }) {
         <p class="muted">Subí ambos CSV y el job se procesará de forma asincrónica.</p>
       </div>
       <form method="post" action="/logout">
-        <button class="ghost" type="submit">Salir</button>
+        <button class="ghost" type="submit" id="logout-button">Salir</button>
       </form>
     </section>
 
@@ -168,7 +172,7 @@ function renderDashboard({ jobs, message }) {
 
     <section class="card">
       <h2>Nuevo procesamiento</h2>
-      <form class="form grid" action="/upload" method="post" enctype="multipart/form-data">
+      <form class="form grid" id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
         <label>
           Detalle Cuotas
           <input type="file" name="detalle" accept=".csv" required />
@@ -179,14 +183,26 @@ function renderDashboard({ jobs, message }) {
         </label>
         <button class="primary" type="submit">Subir archivos</button>
       </form>
+      <div id="upload-progress" class="upload-progress" hidden>
+        <div class="upload-progress__meta" aria-live="polite">
+          <span id="upload-progress-text">Subiendo…</span>
+          <span id="upload-progress-percent">0%</span>
+        </div>
+        <div class="upload-progress__bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="upload-progress-fill" class="upload-progress__fill" style="width: 0%"></div>
+        </div>
+        <div id="upload-progress-hint" class="muted upload-progress__hint">
+          No cierres esta pestaña ni navegues hacia atrás mientras dura la carga.
+        </div>
+      </div>
     </section>
 
     <section class="card">
       <h2>Buscar datos por CUIL</h2>
-      <p class="muted">Buscá un CUIL y revisá los valores calculados.</p>
+      <p class="muted">Buscá un CUIL/DNI y revisá los valores calculados.</p>
       <form class="form grid" id="cuil-qa-form">
         <label>
-          CUIL
+          CUIL/DNI
           <input
             id="cuil-qa-input"
             name="cuil"
@@ -307,13 +323,19 @@ app.post(
     { name: "convenios", maxCount: 1 }
   ]),
   async (req, res) => {
+    const wantsJson = Boolean(req.xhr) || req.accepts(["json", "html"]) === "json";
     const detalleFile = req.files?.detalle?.[0];
     const conveniosFile = req.files?.convenios?.[0];
 
     if (!detalleFile || !conveniosFile) {
-      const jobs = db
-        .prepare("SELECT * FROM jobs ORDER BY id DESC LIMIT 5")
-        .all();
+      if (wantsJson) {
+        return res.status(400).json({ ok: false, error: "Faltan archivos" });
+      }
+      const [rows] = await db.query("SELECT * FROM jobs ORDER BY id DESC LIMIT 5");
+      const jobs = rows.map((r) => ({
+        ...r,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : null
+      }));
       return res.status(400).send(renderDashboard({ jobs, message: "Faltan archivos" }));
     }
 
@@ -385,15 +407,21 @@ app.post(
         runInlineWorker();
       }
 
-      res.redirect("/?message=ok");
+      if (wantsJson) {
+        return res.json({ ok: true, jobId });
+      }
+      return res.redirect("/?message=ok");
     } catch (error) {
       await db.query("UPDATE jobs SET status = ?, message = ? WHERE id = ?", ["failed", error.message, jobId]);
+      if (wantsJson) {
+        return res.status(500).json({ ok: false, error: error.message || "Error subiendo archivos" });
+      }
       const [rows] = await db.query("SELECT * FROM jobs ORDER BY id DESC LIMIT 5");
       const jobs = rows.map((r) => ({
         ...r,
         created_at: r.created_at ? new Date(r.created_at).toISOString() : null
       }));
-      res.status(500).send(renderDashboard({ jobs, message: "Error subiendo archivos" }));
+      return res.status(500).send(renderDashboard({ jobs, message: "Error subiendo archivos" }));
     } finally {
       if (!LOCAL_STORAGE) {
         fs.unlink(detalleFile.path, () => {});
@@ -405,7 +433,13 @@ app.post(
 
 app.get("/api/clientes/:cuil", async (req, res) => {
   const cuil = String(req.params.cuil || "").trim();
-  const [rows] = await db.query("SELECT * FROM cuil_metrics WHERE cuil = ?", [cuil]);
+  const [jobRows] = await db.query("SELECT id FROM jobs WHERE status = 'completed' ORDER BY id DESC LIMIT 1");
+  const latestJobId = jobRows?.[0]?.id;
+  if (!latestJobId) {
+    return res.status(404).json({ error: "No hay jobs completados" });
+  }
+
+  const [rows] = await db.query("SELECT * FROM cuil_metrics WHERE job_id = ? AND cuil = ?", [latestJobId, cuil]);
   const row = rows[0];
 
   if (!row) {
@@ -414,6 +448,7 @@ app.get("/api/clientes/:cuil", async (req, res) => {
 
   return res.json({
     ...row,
+    job_id: latestJobId,
     updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null
   });
 });

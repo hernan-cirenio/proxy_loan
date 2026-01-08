@@ -290,6 +290,46 @@ button.ghost:hover {
   overflow-x: auto;
 }
 
+.upload-progress {
+  margin-top: 16px;
+  padding: 14px 14px 12px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.upload-progress__meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 600;
+  color: rgba(247, 248, 255, 0.92);
+}
+
+.upload-progress__bar {
+  margin-top: 10px;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.upload-progress__fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #2f56ff, #6c5cff);
+  box-shadow: 0 10px 24px rgba(47, 86, 255, 0.25);
+  transition: width 120ms linear;
+}
+
+.upload-progress__hint {
+  margin-top: 10px;
+  font-size: 0.9rem;
+}
+
 .qa-result {
   margin-top: 14px;
 }
@@ -307,6 +347,16 @@ button.ghost:hover {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   margin-top: 14px;
+}
+
+.qa-row {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.qa-row--3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .qa-kv {
@@ -400,6 +450,10 @@ tbody tr:hover td {
   }
 
   .qa-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .qa-row--3 {
     grid-template-columns: 1fr;
   }
 

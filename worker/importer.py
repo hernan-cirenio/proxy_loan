@@ -318,19 +318,30 @@ def process_job(conn, job):
         ]
 
         insert_sql = (
-            "INSERT INTO cuil_metrics (cuil, deuda_a_vencer_total_vigente, suma_cuotas_prestamo_vigente, "
+            "INSERT INTO cuil_metrics (job_id, cuil, deuda_a_vencer_total_vigente, suma_cuotas_prestamo_vigente, "
             "suma_cuotas_prestamo_mes_1, suma_cuotas_prestamo_mes_2, "
             "tiene_refinanciacion_vigente, tiene_refinanciacion_ultimos_6_meses, "
             "dias_atraso_vigente, fec_ult_pago, fec_ult_prestamo, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE "
+            "deuda_a_vencer_total_vigente=VALUES(deuda_a_vencer_total_vigente), "
+            "suma_cuotas_prestamo_vigente=VALUES(suma_cuotas_prestamo_vigente), "
+            "suma_cuotas_prestamo_mes_1=VALUES(suma_cuotas_prestamo_mes_1), "
+            "suma_cuotas_prestamo_mes_2=VALUES(suma_cuotas_prestamo_mes_2), "
+            "tiene_refinanciacion_vigente=VALUES(tiene_refinanciacion_vigente), "
+            "tiene_refinanciacion_ultimos_6_meses=VALUES(tiene_refinanciacion_ultimos_6_meses), "
+            "dias_atraso_vigente=VALUES(dias_atraso_vigente), "
+            "fec_ult_pago=VALUES(fec_ult_pago), "
+            "fec_ult_prestamo=VALUES(fec_ult_prestamo), "
+            "updated_at=VALUES(updated_at)"
         )
 
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM cuil_metrics")
             # Insert in chunks to avoid oversized packets
             chunk_size = int(os.environ.get("DB_INSERT_CHUNK", "2000"))
             for i in range(0, len(rows), chunk_size):
-                cur.executemany(insert_sql, rows[i : i + chunk_size])
+                payload = [(job_id,) + row for row in rows[i : i + chunk_size]]
+                cur.executemany(insert_sql, payload)
 
             cur.execute(
                 "UPDATE jobs SET status = %s, message = %s WHERE id = %s",
@@ -360,6 +371,7 @@ def ensure_schema(conn):
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS cuil_metrics (
+              job_id BIGINT UNSIGNED NOT NULL,
               cuil VARCHAR(32) NOT NULL,
               deuda_a_vencer_total_vigente DOUBLE NULL,
               suma_cuotas_prestamo_vigente DOUBLE NULL,
@@ -371,7 +383,8 @@ def ensure_schema(conn):
               fec_ult_pago DATE NULL,
               fec_ult_prestamo DATE NULL,
               updated_at DATETIME(6) NOT NULL,
-              PRIMARY KEY (cuil),
+              PRIMARY KEY (job_id, cuil),
+              INDEX idx_metrics_cuil_job (cuil, job_id),
               INDEX idx_metrics_updated_at (updated_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """

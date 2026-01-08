@@ -26,13 +26,20 @@ function getSslConfig() {
 }
 
 export function getDb() {
-  if (!process.env.DATABASE_URL) {
-    throw new Error("Missing DATABASE_URL. Configure MySQL connection string in .env");
+  const dbUrl = process.env.DATABASE_URL;
+  if (!dbUrl) {
+    throw new Error("Missing DATABASE_URL. Configure MySQL connection string in .env / App Platform env vars.");
+  }
+  if (dbUrl.includes("${")) {
+    throw new Error(
+      `Invalid DATABASE_URL (looks like an unresolved App Platform placeholder): ${dbUrl}. ` +
+        "Set DATABASE_URL to the actual MySQL connection string (mysql://...) from the database component."
+    );
   }
 
   if (!pool) {
     pool = mysql.createPool({
-      uri: process.env.DATABASE_URL,
+      uri: dbUrl,
       waitForConnections: true,
       connectionLimit: Number(process.env.DB_POOL_SIZE || 10),
       ssl: getSslConfig()
@@ -59,6 +66,7 @@ export async function ensureSchema(db) {
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS cuil_metrics (
+      job_id BIGINT UNSIGNED NOT NULL,
       cuil VARCHAR(32) NOT NULL,
       deuda_a_vencer_total_vigente DOUBLE NULL,
       suma_cuotas_prestamo_vigente DOUBLE NULL,
@@ -70,8 +78,30 @@ export async function ensureSchema(db) {
       fec_ult_pago DATE NULL,
       fec_ult_prestamo DATE NULL,
       updated_at DATETIME(6) NOT NULL,
-      PRIMARY KEY (cuil),
+      PRIMARY KEY (job_id, cuil),
+      INDEX idx_metrics_cuil_job (cuil, job_id),
       INDEX idx_metrics_updated_at (updated_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+
+  // Lightweight migration for existing installs that had PRIMARY KEY(cuil)
+  // and no job_id column. We attach legacy rows to job_id=0.
+  const [colRows] = await db.query(
+    `
+      SELECT COUNT(*) AS cnt
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'cuil_metrics'
+        AND COLUMN_NAME = 'job_id'
+    `
+  );
+  const hasJobId = Number(colRows?.[0]?.cnt || 0) > 0;
+
+  if (!hasJobId) {
+    await db.query(`ALTER TABLE cuil_metrics ADD COLUMN job_id BIGINT UNSIGNED NULL FIRST`);
+    await db.query(`UPDATE cuil_metrics SET job_id = 0 WHERE job_id IS NULL`);
+    await db.query(`ALTER TABLE cuil_metrics MODIFY job_id BIGINT UNSIGNED NOT NULL`);
+    await db.query(`ALTER TABLE cuil_metrics DROP PRIMARY KEY, ADD PRIMARY KEY (job_id, cuil)`);
+    await db.query(`CREATE INDEX idx_metrics_cuil_job ON cuil_metrics (cuil, job_id)`);
+  }
 }
