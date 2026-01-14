@@ -44,8 +44,8 @@ function renderCuilResult(container, cuil, data) {
   const cuotasRow = `
     <div class="qa-row qa-row--3">
       ${kv("Cuotas mes actual", formatMoney(data.suma_cuotas_prestamo_vigente))}
-      ${kv("Cuotas mes -1", formatMoney(data.suma_cuotas_prestamo_mes_1))}
-      ${kv("Cuotas mes -2", formatMoney(data.suma_cuotas_prestamo_mes_2))}
+      ${kv("Cuotas mes +1", formatMoney(data.suma_cuotas_prestamo_mes_1))}
+      ${kv("Cuotas mes +2", formatMoney(data.suma_cuotas_prestamo_mes_2))}
     </div>
   `;
 

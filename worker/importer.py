@@ -17,6 +17,8 @@ LOCAL_STORAGE = os.environ.get("LOCAL_STORAGE", "false").lower() == "true"
 LOCAL_STORAGE_DIR = os.environ.get("LOCAL_STORAGE_DIR", "/data/uploads")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "20"))
 RUN_ONCE = os.environ.get("RUN_ONCE", "false").lower() == "true"
+REPROCESS_JOB_ID = os.environ.get("REPROCESS_JOB_ID")
+REPROCESS_LATEST_COMPLETED = os.environ.get("REPROCESS_LATEST_COMPLETED", "false").lower() == "true"
 
 
 def _get_mysql_ssl():
@@ -233,8 +235,8 @@ def month_offset(base, offset):
 def build_metrics(detalle_data, convenio_data):
     today = date.today()
     current_key = month_key(today)
-    prev_key = month_offset(today, -1)
-    prev2_key = month_offset(today, -2)
+    next_key = month_offset(today, 1)
+    next2_key = month_offset(today, 2)
     metrics = {}
 
     all_cuils = set(detalle_data.keys()) | set(convenio_data.keys())
@@ -252,9 +254,10 @@ def build_metrics(detalle_data, convenio_data):
 
         metrics[cuil] = {
             "deuda_a_vencer_total_vigente": detalle.get("deuda_a_vencer", 0.0),
-            "suma_cuotas_prestamo_vigente": cuotas.get(current_key, 0.0),
-            "suma_cuotas_prestamo_mes_1": cuotas.get(prev_key, 0.0),
-            "suma_cuotas_prestamo_mes_2": cuotas.get(prev2_key, 0.0),
+            # Business rule: must match deuda_a_vencer_total_vigente exactly
+            "suma_cuotas_prestamo_vigente": detalle.get("deuda_a_vencer", 0.0),
+            "suma_cuotas_prestamo_mes_1": cuotas.get(next_key, 0.0),
+            "suma_cuotas_prestamo_mes_2": cuotas.get(next2_key, 0.0),
             "tiene_refinanciacion_vigente": convenio.get("tiene_refi", "NO"),
             "tiene_refinanciacion_ultimos_6_meses": convenio.get("tiene_refi_6m", "NO"),
             "dias_atraso_vigente": dias_atraso,
@@ -393,8 +396,20 @@ def ensure_schema(conn):
 
 def run_pending_jobs(conn):
     with conn.cursor() as cur:
-        cur.execute("SELECT id, detalle_key, convenios_key FROM jobs WHERE status = 'uploaded' ORDER BY id")
-        jobs = cur.fetchall()
+        if REPROCESS_JOB_ID:
+            cur.execute(
+                "SELECT id, detalle_key, convenios_key FROM jobs WHERE id = %s",
+                (int(REPROCESS_JOB_ID),),
+            )
+            jobs = cur.fetchall()
+        elif REPROCESS_LATEST_COMPLETED:
+            cur.execute(
+                "SELECT id, detalle_key, convenios_key FROM jobs WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
+            )
+            jobs = cur.fetchall()
+        else:
+            cur.execute("SELECT id, detalle_key, convenios_key FROM jobs WHERE status = 'uploaded' ORDER BY id")
+            jobs = cur.fetchall()
 
     for job in jobs:
         try:
