@@ -11,7 +11,8 @@ const PORT = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET || "change-me";
 const APP_USER = process.env.APP_USER || "admin";
 const APP_PASS = process.env.APP_PASS || "secret";
-const API_KEY = process.env.API_KEY || "";
+const API_KEY_CIRENIO = process.env.API_KEY_CIRENIO || "";
+const API_KEY_BESMART = process.env.API_KEY_BESMART || "";
 
 const DO_SPACES_ENDPOINT = process.env.DO_SPACES_ENDPOINT;
 const DO_SPACES_BUCKET = process.env.DO_SPACES_BUCKET;
@@ -25,6 +26,8 @@ const INLINE_PROCESS = process.env.INLINE_PROCESS === "true";
 const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
 
 const app = express();
+// Behind DigitalOcean App Platform / load balancers, trust proxy so req.ip uses X-Forwarded-For.
+app.set("trust proxy", 1);
 const db = getDb();
 await ensureSchema(db);
 
@@ -36,20 +39,56 @@ function requireApiAuth(req, res, next) {
     return next();
   }
 
-  if (!API_KEY) {
-    return res.status(401).json({ error: "API_KEY no configurada" });
-  }
-
   const headerKey = req.get("x-api-key");
   const authHeader = req.get("authorization") || "";
   const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
   const provided = headerKey || bearer;
 
-  if (provided && provided === API_KEY) {
-    return next();
+  const keys = [
+    { name: "cirenio", value: API_KEY_CIRENIO },
+    { name: "besmart", value: API_KEY_BESMART }
+  ].filter((k) => k.value);
+
+  if (keys.length === 0) {
+    return res.status(401).json({ error: "API keys no configuradas" });
   }
 
-  return res.status(401).json({ error: "API key inválida" });
+  const match = provided ? keys.find((k) => k.value === provided) : null;
+  if (!match) {
+    return res.status(401).json({ error: "API key inválida" });
+  }
+
+  // Attach info for logging
+  req.api_client = match.name;
+
+  return next();
+}
+
+function getClientIp(req) {
+  const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return fwd || req.ip || null;
+}
+
+function apiRequestLogger(req, res, next) {
+  // Only log requests authenticated via API key (not session UI)
+  const apiClient = req.api_client;
+  if (!apiClient) return next();
+
+  const started = new Date();
+  const ip = getClientIp(req);
+  const userAgent = req.get("user-agent") || null;
+  const path = req.originalUrl || req.url;
+  const cuil = req.params?.cuil ? String(req.params.cuil) : null;
+
+  res.on("finish", () => {
+    // Fire and forget; do not block response.
+    db.query(
+      "INSERT INTO api_requests (created_at, api_client, ip, method, path, cuil, status_code, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [started, apiClient, ip, req.method, path, cuil, res.statusCode, userAgent]
+    ).catch(() => {});
+  });
+
+  next();
 }
 
 function createS3Client() {
@@ -277,6 +316,7 @@ function requireAuth(req, res, next) {
 
 // Protect all API endpoints via session or API key.
 app.use("/api", requireApiAuth);
+app.use("/api", apiRequestLogger);
 
 app.get("/login", (req, res) => {
   if (req.session?.user === true) {
@@ -431,8 +471,21 @@ app.post(
   }
 );
 
-app.get("/api/clientes/:cuil", async (req, res) => {
+app.get("/api/loan/clients/:cuil", async (req, res) => {
+  return handleClienteMetricsRequest(req, res, { source: "proxy" });
+});
+
+app.get("/api/clients/:cuil", async (req, res) => {
+  // Placeholder endpoint for future Cirenio Core integration.
+  // For now it returns the same payload as /api/clients/:cuil.
+  return handleClienteMetricsRequest(req, res, { source: "core_mock" });
+});
+
+async function handleClienteMetricsRequest(req, res, { source }) {
   const cuil = String(req.params.cuil || "").trim();
+
+  // In the future, this should call Cirenio Core (external integration).
+  // For now, we return the latest processed snapshot from our DB.
   const [jobRows] = await db.query("SELECT id FROM jobs WHERE status = 'completed' ORDER BY id DESC LIMIT 1");
   const latestJobId = jobRows?.[0]?.id;
   if (!latestJobId) {
@@ -449,9 +502,10 @@ app.get("/api/clientes/:cuil", async (req, res) => {
   return res.json({
     ...row,
     job_id: latestJobId,
-    updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null
+    updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+    source
   });
-});
+}
 
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });

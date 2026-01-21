@@ -23,9 +23,15 @@ Modulo para importar CSVs, recalcular variables por CUIL y exponer una API REST.
 
 ## Seguridad (API Key)
 - Los endpoints bajo `/api/*` requieren **sesión** (login UI) **o** **API KEY**.
-- Configurar `API_KEY` en `.env`.
+- Configurar `API_KEY_CIRENIO` y/o `API_KEY_BESMART` en `.env`.
 - En Postman enviar:
   - Header `x-api-key: <API_KEY>` o `Authorization: Bearer <API_KEY>`.
+
+## Auditoría (API requests)
+- Cuando se autentica con API key, la API registra cada request en la tabla `api_requests` con:
+  - `api_client` (cirenio / besmart)
+  - `ip` (desde `X-Forwarded-For` / `req.ip`)
+  - `path`, `method`, `status_code`, `cuil`, `user_agent`
 
 ## Desarrollo local sin DO Spaces
 - Setear `LOCAL_STORAGE=true` y `LOCAL_STORAGE_DIR=./data/uploads` en `.env`.
@@ -39,6 +45,7 @@ Modulo para importar CSVs, recalcular variables por CUIL y exponer una API REST.
 - UI: `GET /` (login requerido).
 - API health: `GET /api/health`.
 - API cliente: `GET /api/clientes/:cuil` (404 si no existe).
+- API core (mock): `GET /api/core/clientes/:cuil` (misma interfaz/payload que `/api/clientes/:cuil`).
 
 ## Notas
 - Cada importacion elimina los datos previos y recalcula todo.

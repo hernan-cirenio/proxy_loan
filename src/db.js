@@ -84,6 +84,24 @@ export async function ensureSchema(db) {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS api_requests (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      created_at DATETIME(6) NOT NULL,
+      api_client VARCHAR(32) NOT NULL,
+      ip VARCHAR(64) NULL,
+      method VARCHAR(16) NOT NULL,
+      path TEXT NOT NULL,
+      cuil VARCHAR(32) NULL,
+      status_code INT NULL,
+      user_agent TEXT NULL,
+      PRIMARY KEY (id),
+      INDEX idx_api_requests_created_at (created_at),
+      INDEX idx_api_requests_client_created_at (api_client, created_at),
+      INDEX idx_api_requests_cuil_created_at (cuil, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
   // Lightweight migration for existing installs that had PRIMARY KEY(cuil)
   // and no job_id column. We attach legacy rows to job_id=0.
   const [colRows] = await db.query(
