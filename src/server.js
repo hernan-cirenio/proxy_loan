@@ -499,9 +499,12 @@ async function handleClienteMetricsRequest(req, res, { source }) {
     return res.status(404).json({ error: "CUIL no encontrado" });
   }
 
+  // Do not expose internal job_id in the public API response.
+  // eslint-disable-next-line no-unused-vars
+  const { job_id: _jobId, ...publicRow } = row;
+
   return res.json({
-    ...row,
-    job_id: latestJobId,
+    ...publicRow,
     updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
     source
   });
