@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import session from "express-session";
 import multer from "multer";
@@ -475,10 +476,165 @@ app.get("/api/loan/clients/:cuil", async (req, res) => {
   return handleClienteMetricsRequest(req, res, { source: "proxy" });
 });
 
+async function fetchCoreApiData(cuil) {
+  const apiHost = process.env.LOANS_API_HOST;
+  const apiKey = process.env.LOANS_API_KEY;
+
+  if (!apiHost || !apiKey) {
+    console.error("[fetchCoreApiData] Configuración faltante:", { hasHost: !!apiHost, hasKey: !!apiKey });
+    throw new Error("Configuración de API no disponible");
+  }
+
+  const url = `${apiHost}/api/v2/customers/${cuil}/history`;
+  console.log(`[fetchCoreApiData] Iniciando llamada para CUIL: ${cuil}`);
+  console.log(`[fetchCoreApiData] URL: ${url}`);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    console.warn(`[fetchCoreApiData] Timeout después de 10 segundos para CUIL: ${cuil}`);
+    controller.abort();
+  }, 10000);
+
+  try {
+    console.log(`[fetchCoreApiData] Ejecutando fetch...`);
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "X-API-KEY": apiKey,
+        "Content-Type": "application/json"
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+    console.log(`[fetchCoreApiData] Respuesta recibida. Status: ${response.status} ${response.statusText}`);
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "No se pudo leer el cuerpo de la respuesta");
+      console.error(`[fetchCoreApiData] Respuesta no OK. Status: ${response.status}, Body: ${errorText.substring(0, 200)}`);
+      
+      if (response.status === 404) {
+        throw new Error("CUIL no encontrado");
+      }
+      throw new Error(`API retornó error ${response.status}: ${errorText.substring(0, 100)}`);
+    }
+
+    console.log(`[fetchCoreApiData] Parseando respuesta JSON...`);
+    const apiResponse = await response.json().catch((parseError) => {
+      console.error(`[fetchCoreApiData] Error al parsear JSON:`, parseError.message);
+      throw new Error(`Error al parsear respuesta JSON: ${parseError.message}`);
+    });
+
+    console.log(`[fetchCoreApiData] JSON parseado exitosamente. Code: ${apiResponse.code}, Message: ${apiResponse.message || 'N/A'}`);
+
+    if (!apiResponse.data) {
+      console.error(`[fetchCoreApiData] Respuesta inválida: falta campo 'data'`, { keys: Object.keys(apiResponse) });
+      throw new Error("Respuesta de API inválida: falta campo 'data'");
+    }
+
+    const d = apiResponse.data;
+    console.log(`[fetchCoreApiData] Datos extraídos exitosamente. CUIL: ${d.customer?.identification?.cuil || cuil}`);
+
+    // Mapear la respuesta de la API externa al formato esperado
+    const mappedData = {
+      cuil: d.customer?.identification?.cuil || cuil,
+      deuda_a_vencer_total_vigente: d.summary?.total_debt ?? d.active_loans_data?.total_due_debt_active ?? null,
+      suma_cuotas_prestamo_vigente: d.active_loans_data?.active_loans_installments_sum ?? null,
+      suma_cuotas_prestamo_mes_1: d.active_loans_data?.month_1_installments_sum ?? null,
+      suma_cuotas_prestamo_mes_2: d.active_loans_data?.month_2_installments_sum ?? null,
+      tiene_refinanciacion_vigente: d.refinancing?.has_active_refinancing ? "SI" : "NO",
+      tiene_refinanciacion_ultimos_6_meses: d.refinancing?.has_refinancing_last_6_months ? "SI" : "NO",
+      dias_atraso_vigente: d.default_info?.days_in_default ?? null,
+      fec_ult_pago: d.default_info?.last_payment_date || null,
+      fec_ult_prestamo: d.last_loan_date || null,
+      updated_at: d.customer?.updated_at ? new Date(d.customer.updated_at).toISOString() : new Date().toISOString(),
+      source: "core"
+    };
+
+    console.log(`[fetchCoreApiData] Mapeo completado exitosamente para CUIL: ${cuil}`);
+    return mappedData;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    
+    // Log detallado del error
+    console.error(`[fetchCoreApiData] Error capturado para CUIL: ${cuil}`);
+    console.error(`[fetchCoreApiData] Error name: ${error.name}`);
+    console.error(`[fetchCoreApiData] Error message: ${error.message}`);
+    console.error(`[fetchCoreApiData] Error code: ${error.code || 'N/A'}`);
+    
+    if (error.cause) {
+      console.error(`[fetchCoreApiData] Error cause:`, error.cause);
+    }
+    
+    if (error.stack) {
+      console.error(`[fetchCoreApiData] Stack trace:`, error.stack);
+    }
+
+    // Mejorar mensaje de error para "fetch failed"
+    if (error.message?.includes("fetch failed") || error.name === "TypeError") {
+      const detailedMessage = error.cause 
+        ? `Error de conexión: ${error.cause.message || error.cause}`
+        : `Error de conexión: ${error.message}`;
+      console.error(`[fetchCoreApiData] Error de fetch detectado. URL: ${url}`);
+      throw new Error(detailedMessage);
+    }
+
+    if (error.name === "AbortError") {
+      throw new Error("Timeout al conectar con la API externa");
+    }
+
+    if (error.code === "ECONNREFUSED" || error.code === "ENOTFOUND") {
+      throw new Error(`Error de conexión: ${error.code === "ECONNREFUSED" ? "Conexión rechazada" : "Host no encontrado"}`);
+    }
+
+    // Re-lanzar el error con el mensaje original si no es un caso especial
+    throw error;
+  }
+}
+
 app.get("/api/clients/:cuil", async (req, res) => {
-  // Placeholder endpoint for future Cirenio Core integration.
-  // For now it returns the same payload as /api/clients/:cuil.
-  return handleClienteMetricsRequest(req, res, { source: "core_mock" });
+  const cuil = String(req.params.cuil || "").trim();
+  let responded = false;
+
+  const sendResponse = (status, data) => {
+    if (responded) return;
+    responded = true;
+    return res.status(status).json(data);
+  };
+
+  try {
+    console.log(`[/api/clients/:cuil] Procesando solicitud para CUIL: ${cuil}`);
+    const data = await fetchCoreApiData(cuil);
+    console.log(`[/api/clients/:cuil] Datos obtenidos exitosamente para CUIL: ${cuil}`);
+    return sendResponse(200, data);
+  } catch (error) {
+    if (responded) {
+      console.warn(`[/api/clients/:cuil] Intento de respuesta duplicada para CUIL: ${cuil}`);
+      return;
+    }
+
+    console.error(`[/api/clients/:cuil] Error procesando solicitud para CUIL: ${cuil}`, error.message);
+
+    // Mapear errores a códigos HTTP apropiados
+    if (error.message === "CUIL no encontrado") {
+      return sendResponse(404, { error: error.message });
+    }
+    
+    if (error.message?.includes("Timeout")) {
+      return sendResponse(504, { error: error.message });
+    }
+    
+    if (error.message?.includes("conexión") || error.message?.includes("Error de conexión")) {
+      return sendResponse(503, { error: error.message });
+    }
+    
+    if (error.message === "Configuración de API no disponible") {
+      return sendResponse(500, { error: error.message });
+    }
+
+    // Error genérico
+    return sendResponse(500, { error: error.message || "Error al procesar la solicitud" });
+  }
 });
 
 async function handleClienteMetricsRequest(req, res, { source }) {
