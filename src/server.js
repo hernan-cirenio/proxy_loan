@@ -482,7 +482,7 @@ async function fetchCoreApiData(cuil) {
 
   if (!apiHost || !apiKey) {
     console.error("[fetchCoreApiData] Configuración faltante:", { hasHost: !!apiHost, hasKey: !!apiKey });
-    throw new Error("Configuración de API no disponible");
+    throw new Error("INTERNAL_ERROR");
   }
 
   const url = `${apiHost}/api/v2/customers/${cuil}/history`;
@@ -516,20 +516,23 @@ async function fetchCoreApiData(cuil) {
       if (response.status === 404) {
         throw new Error("CUIL no encontrado");
       }
-      throw new Error(`API retornó error ${response.status}: ${errorText.substring(0, 100)}`);
+      // Cualquier otro error HTTP es técnico, usar mensaje genérico
+      throw new Error("INTERNAL_ERROR");
     }
 
     console.log(`[fetchCoreApiData] Parseando respuesta JSON...`);
     const apiResponse = await response.json().catch((parseError) => {
       console.error(`[fetchCoreApiData] Error al parsear JSON:`, parseError.message);
-      throw new Error(`Error al parsear respuesta JSON: ${parseError.message}`);
+      // Error técnico, usar mensaje genérico
+      throw new Error("INTERNAL_ERROR");
     });
 
     console.log(`[fetchCoreApiData] JSON parseado exitosamente. Code: ${apiResponse.code}, Message: ${apiResponse.message || 'N/A'}`);
 
     if (!apiResponse.data) {
       console.error(`[fetchCoreApiData] Respuesta inválida: falta campo 'data'`, { keys: Object.keys(apiResponse) });
-      throw new Error("Respuesta de API inválida: falta campo 'data'");
+      // Error técnico, usar mensaje genérico
+      throw new Error("INTERNAL_ERROR");
     }
 
     const d = apiResponse.data;
@@ -556,7 +559,7 @@ async function fetchCoreApiData(cuil) {
   } catch (error) {
     clearTimeout(timeoutId);
     
-    // Log detallado del error
+    // Log detallado del error (solo para debugging interno)
     console.error(`[fetchCoreApiData] Error capturado para CUIL: ${cuil}`);
     console.error(`[fetchCoreApiData] Error name: ${error.name}`);
     console.error(`[fetchCoreApiData] Error message: ${error.message}`);
@@ -570,25 +573,16 @@ async function fetchCoreApiData(cuil) {
       console.error(`[fetchCoreApiData] Stack trace:`, error.stack);
     }
 
-    // Mejorar mensaje de error para "fetch failed"
-    if (error.message?.includes("fetch failed") || error.name === "TypeError") {
-      const detailedMessage = error.cause 
-        ? `Error de conexión: ${error.cause.message || error.cause}`
-        : `Error de conexión: ${error.message}`;
-      console.error(`[fetchCoreApiData] Error de fetch detectado. URL: ${url}`);
-      throw new Error(detailedMessage);
+    // Solo "CUIL no encontrado" es parte del contrato de la API
+    // Todos los demás errores son técnicos y deben ser genéricos
+    if (error.message === "CUIL no encontrado") {
+      // Este es el único error del contrato, mantenerlo
+      throw error;
     }
 
-    if (error.name === "AbortError") {
-      throw new Error("Timeout al conectar con la API externa");
-    }
-
-    if (error.code === "ECONNREFUSED" || error.code === "ENOTFOUND") {
-      throw new Error(`Error de conexión: ${error.code === "ECONNREFUSED" ? "Conexión rechazada" : "Host no encontrado"}`);
-    }
-
-    // Re-lanzar el error con el mensaje original si no es un caso especial
-    throw error;
+    // Todos los demás errores son técnicos: conexión, timeout, parsing, configuración, etc.
+    // Lanzar error genérico sin detalles técnicos
+    throw new Error("INTERNAL_ERROR");
   }
 }
 
@@ -613,27 +607,22 @@ app.get("/api/clients/:cuil", async (req, res) => {
       return;
     }
 
-    console.error(`[/api/clients/:cuil] Error procesando solicitud para CUIL: ${cuil}`, error.message);
+    // Log detallado para debugging interno (no se expone al cliente)
+    console.error(`[/api/clients/:cuil] Error procesando solicitud para CUIL: ${cuil}`);
+    console.error(`[/api/clients/:cuil] Error name: ${error.name}`);
+    console.error(`[/api/clients/:cuil] Error message: ${error.message}`);
+    if (error.stack) {
+      console.error(`[/api/clients/:cuil] Stack trace:`, error.stack);
+    }
 
-    // Mapear errores a códigos HTTP apropiados
+    // Solo exponer errores explícitamente contemplados en el contrato de la API
     if (error.message === "CUIL no encontrado") {
       return sendResponse(404, { error: error.message });
     }
-    
-    if (error.message?.includes("Timeout")) {
-      return sendResponse(504, { error: error.message });
-    }
-    
-    if (error.message?.includes("conexión") || error.message?.includes("Error de conexión")) {
-      return sendResponse(503, { error: error.message });
-    }
-    
-    if (error.message === "Configuración de API no disponible") {
-      return sendResponse(500, { error: error.message });
-    }
 
-    // Error genérico
-    return sendResponse(500, { error: error.message || "Error al procesar la solicitud" });
+    // Todos los demás errores (técnicos, de infraestructura, runtime, etc.)
+    // se reemplazan por un mensaje genérico neutro
+    return sendResponse(500, { error: "Ocurrió un error inesperado. Intente nuevamente más tarde." });
   }
 });
 
