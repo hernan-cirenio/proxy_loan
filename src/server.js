@@ -33,6 +33,14 @@ await ensureSchema(db);
 
 const upload = multer({ dest: LOCAL_STORAGE_DIR });
 
+function normalizeIdentifier(value) {
+  return String(value ?? "").replace(/\D/g, "").trim();
+}
+
+function isValidIdentifier(value) {
+  return /^[0-9]{1,11}$/.test(String(value ?? ""));
+}
+
 function requireApiAuth(req, res, next) {
   // Allow authenticated UI sessions to use /api/* without exposing the API key to the browser.
   if (req.session?.user === true) {
@@ -61,6 +69,13 @@ function requireApiAuth(req, res, next) {
   // Attach info for logging
   req.api_client = match.name;
 
+  return next();
+}
+
+function requireCirenioApiKey(req, res, next) {
+  if (req.api_client !== "cirenio") {
+    return res.status(403).json({ error: "API key de Cirenio requerida" });
+  }
   return next();
 }
 
@@ -475,27 +490,27 @@ app.get("/api/loan/clients/:cuil", async (req, res) => {
   return handleClienteMetricsRequest(req, res, { source: "proxy" });
 });
 
-async function fetchCoreApiData(cuil) {
+async function fetchCoreApiDataByUid(customerUid, requestedIdentifier, person) {
   const apiHost = process.env.LOANS_API_HOST;
   const apiKey = process.env.LOANS_API_KEY;
 
   if (!apiHost || !apiKey) {
-    console.error("[fetchCoreApiData] Configuración faltante:", { hasHost: !!apiHost, hasKey: !!apiKey });
+    console.error("[fetchCoreApiDataByUid] Configuración faltante:", { hasHost: !!apiHost, hasKey: !!apiKey });
     throw new Error("INTERNAL_ERROR");
   }
 
-  const url = `${apiHost}/api/v2/customers/${cuil}/history`;
-  console.log(`[fetchCoreApiData] Iniciando llamada para CUIL: ${cuil}`);
-  console.log(`[fetchCoreApiData] URL: ${url}`);
+  const url = `${apiHost}/api/v3/customers/${encodeURIComponent(customerUid)}/history`;
+  console.log(`[fetchCoreApiDataByUid] Iniciando llamada para uid: ${customerUid}`);
+  console.log(`[fetchCoreApiDataByUid] URL: ${url}`);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
-    console.warn(`[fetchCoreApiData] Timeout después de 10 segundos para CUIL: ${cuil}`);
+    console.warn(`[fetchCoreApiDataByUid] Timeout después de 10 segundos para uid: ${customerUid}`);
     controller.abort();
   }, 10000);
 
   try {
-    console.log(`[fetchCoreApiData] Ejecutando fetch...`);
+    console.log("[fetchCoreApiDataByUid] Ejecutando fetch...");
     const response = await fetch(url, {
       method: "GET",
       headers: {
@@ -506,41 +521,45 @@ async function fetchCoreApiData(cuil) {
     });
 
     clearTimeout(timeoutId);
-    console.log(`[fetchCoreApiData] Respuesta recibida. Status: ${response.status} ${response.statusText}`);
+    console.log(`[fetchCoreApiDataByUid] Respuesta recibida. Status: ${response.status} ${response.statusText}`);
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => "No se pudo leer el cuerpo de la respuesta");
-      console.error(`[fetchCoreApiData] Respuesta no OK. Status: ${response.status}, Body: ${errorText.substring(0, 200)}`);
-      
+      console.error(
+        `[fetchCoreApiDataByUid] Respuesta no OK. Status: ${response.status}, Body: ${errorText.substring(0, 200)}`
+      );
+
       if (response.status === 404) {
         throw new Error("CUIL no encontrado");
       }
-      // Cualquier otro error HTTP es técnico, usar mensaje genérico
       throw new Error("INTERNAL_ERROR");
     }
 
-    console.log(`[fetchCoreApiData] Parseando respuesta JSON...`);
+    console.log("[fetchCoreApiDataByUid] Parseando respuesta JSON...");
     const apiResponse = await response.json().catch((parseError) => {
-      console.error(`[fetchCoreApiData] Error al parsear JSON:`, parseError.message);
-      // Error técnico, usar mensaje genérico
+      console.error("[fetchCoreApiDataByUid] Error al parsear JSON:", parseError.message);
       throw new Error("INTERNAL_ERROR");
     });
 
-    console.log(`[fetchCoreApiData] JSON parseado exitosamente. Code: ${apiResponse.code}, Message: ${apiResponse.message || 'N/A'}`);
+    console.log(
+      `[fetchCoreApiDataByUid] JSON parseado exitosamente. Code: ${apiResponse.code}, Message: ${apiResponse.message || "N/A"}`
+    );
 
     if (!apiResponse.data) {
-      console.error(`[fetchCoreApiData] Respuesta inválida: falta campo 'data'`, { keys: Object.keys(apiResponse) });
-      // Error técnico, usar mensaje genérico
+      console.error("[fetchCoreApiDataByUid] Respuesta inválida: falta campo 'data'", { keys: Object.keys(apiResponse) });
       throw new Error("INTERNAL_ERROR");
     }
 
     const d = apiResponse.data;
-    console.log(`[fetchCoreApiData] Datos extraídos exitosamente. CUIL: ${d.customer?.identification?.cuil || cuil}`);
+    console.log(
+      `[fetchCoreApiDataByUid] Datos extraídos exitosamente. CUIL: ${
+        d.customer?.identification?.cuil || person?.cuil || requestedIdentifier
+      }`
+    );
 
-    // Mapear la respuesta de la API externa al formato esperado
     const mappedData = {
-      cuil: d.customer?.identification?.cuil || cuil,
-      deuda_a_vencer_total_vigente: d.summary?.total_debt ?? d.active_loans_data?.total_due_debt_active ?? null,
+      cuil: d.customer?.identification?.cuil || person?.cuil || requestedIdentifier,
+      deuda_a_vencer_total_vigente: d.active_loans_data?.total_due_debt_active ?? d.summary?.financial?.total_debt ?? null,
       suma_cuotas_prestamo_vigente: d.active_loans_data?.active_loans_installments_sum ?? null,
       suma_cuotas_prestamo_mes_1: d.active_loans_data?.month_1_installments_sum ?? null,
       suma_cuotas_prestamo_mes_2: d.active_loans_data?.month_2_installments_sum ?? null,
@@ -549,44 +568,155 @@ async function fetchCoreApiData(cuil) {
       dias_atraso_vigente: d.default_info?.days_in_default ?? null,
       fec_ult_pago: d.default_info?.last_payment_date || null,
       fec_ult_prestamo: d.last_loan_date || null,
-      updated_at: d.customer?.updated_at ? new Date(d.customer.updated_at).toISOString() : new Date().toISOString(),
+      updated_at: d.updated_at ? new Date(d.updated_at).toISOString() : new Date().toISOString(),
       source: "core"
     };
 
-    console.log(`[fetchCoreApiData] Mapeo completado exitosamente para CUIL: ${cuil}`);
+    console.log(`[fetchCoreApiDataByUid] Mapeo completado exitosamente para uid: ${customerUid}`);
     return mappedData;
   } catch (error) {
     clearTimeout(timeoutId);
-    
-    // Log detallado del error (solo para debugging interno)
-    console.error(`[fetchCoreApiData] Error capturado para CUIL: ${cuil}`);
-    console.error(`[fetchCoreApiData] Error name: ${error.name}`);
-    console.error(`[fetchCoreApiData] Error message: ${error.message}`);
-    console.error(`[fetchCoreApiData] Error code: ${error.code || 'N/A'}`);
-    
+
+    console.error(`[fetchCoreApiDataByUid] Error capturado para uid: ${customerUid}`);
+    console.error(`[fetchCoreApiDataByUid] Error name: ${error.name}`);
+    console.error(`[fetchCoreApiDataByUid] Error message: ${error.message}`);
+    console.error(`[fetchCoreApiDataByUid] Error code: ${error.code || "N/A"}`);
+
     if (error.cause) {
-      console.error(`[fetchCoreApiData] Error cause:`, error.cause);
-    }
-    
-    if (error.stack) {
-      console.error(`[fetchCoreApiData] Stack trace:`, error.stack);
+      console.error("[fetchCoreApiDataByUid] Error cause:", error.cause);
     }
 
-    // Solo "CUIL no encontrado" es parte del contrato de la API
-    // Todos los demás errores son técnicos y deben ser genéricos
+    if (error.stack) {
+      console.error("[fetchCoreApiDataByUid] Stack trace:", error.stack);
+    }
+
     if (error.message === "CUIL no encontrado") {
-      // Este es el único error del contrato, mantenerlo
       throw error;
     }
 
-    // Todos los demás errores son técnicos: conexión, timeout, parsing, configuración, etc.
-    // Lanzar error genérico sin detalles técnicos
     throw new Error("INTERNAL_ERROR");
   }
 }
 
+async function resolveCirenioPerson(identifier) {
+  const [byCuil] = await db.query(
+    "SELECT uid, cuil, dni, gender, created_at, updated_at FROM cirenio_persons WHERE cuil = ? LIMIT 2",
+    [identifier]
+  );
+
+  if (byCuil.length > 1) {
+    const error = new Error("MULTIPLE_PERSON_MATCHES");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  if (byCuil.length === 1) {
+    return { person: byCuil[0], matchedBy: "cuil" };
+  }
+
+  const [byDni] = await db.query(
+    "SELECT uid, cuil, dni, gender, created_at, updated_at FROM cirenio_persons WHERE dni = ? LIMIT 2",
+    [identifier]
+  );
+
+  if (byDni.length > 1) {
+    const error = new Error("MULTIPLE_PERSON_MATCHES");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  if (byDni.length === 1) {
+    return { person: byDni[0], matchedBy: "dni" };
+  }
+
+  return null;
+}
+
+app.post("/api/core/persons", requireCirenioApiKey, async (req, res) => {
+  const cuil = normalizeIdentifier(req.body?.cuil);
+  const dni = normalizeIdentifier(req.body?.dni);
+  const uid = String(req.body?.uid || "").trim();
+  const rawGender = String(req.body?.gender || req.body?.genero || "").trim().toLowerCase();
+  const gender = rawGender || null;
+
+  if (!uid || !cuil || !dni) {
+    return res.status(400).json({ error: "Faltan campos requeridos: cuil, dni, uid" });
+  }
+
+  if (!/^[0-9]{11}$/.test(cuil)) {
+    return res.status(400).json({ error: "CUIL inválido" });
+  }
+
+  if (!isValidIdentifier(dni)) {
+    return res.status(400).json({ error: "DNI inválido" });
+  }
+
+  if (uid.length !== 8) {
+    return res.status(400).json({ error: "UID inválido" });
+  }
+
+  if (gender && !["m", "f", "x"].includes(gender)) {
+    return res.status(400).json({ error: "Gender inválido" });
+  }
+
+  let conn;
+  try {
+    conn = await db.getConnection();
+    await conn.beginTransaction();
+
+    const [uidRows] = await conn.query("SELECT uid, cuil, dni FROM cirenio_persons WHERE uid = ? LIMIT 1", [uid]);
+    const existingByUid = uidRows[0] || null;
+
+    const [cuilRows] = await conn.query("SELECT uid, cuil, dni FROM cirenio_persons WHERE cuil = ? LIMIT 1", [cuil]);
+    const existingByCuil = cuilRows[0] || null;
+
+    if (existingByUid && existingByUid.cuil && existingByUid.cuil !== cuil) {
+      await conn.rollback();
+      return res.status(409).json({ error: "UID ya asociado a otro CUIL" });
+    }
+
+    if (existingByCuil && existingByCuil.uid !== uid) {
+      await conn.rollback();
+      return res.status(409).json({ error: "CUIL ya asociado a otro UID" });
+    }
+
+    const now = new Date();
+    if (existingByUid) {
+      await conn.query(
+        "UPDATE cirenio_persons SET cuil = ?, dni = ?, gender = ?, updated_at = ? WHERE uid = ?",
+        [cuil, dni, gender, now, uid]
+      );
+      await conn.commit();
+      return res.status(200).json({
+        ok: true,
+        created: false,
+        person: { uid, cuil, dni, gender, updated_at: now.toISOString() }
+      });
+    }
+
+    await conn.query(
+      "INSERT INTO cirenio_persons (uid, cuil, dni, gender, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      [uid, cuil, dni, gender, now, now]
+    );
+    await conn.commit();
+    return res.status(201).json({
+      ok: true,
+      created: true,
+      person: { uid, cuil, dni, gender, created_at: now.toISOString(), updated_at: now.toISOString() }
+    });
+  } catch (error) {
+    if (conn) {
+      await conn.rollback().catch(() => {});
+    }
+    console.error("[POST /api/core/persons] Error:", error);
+    return res.status(500).json({ error: "Ocurrió un error inesperado. Intente nuevamente más tarde." });
+  } finally {
+    conn?.release();
+  }
+});
+
 app.get("/api/clients/:cuil", async (req, res) => {
-  const cuil = String(req.params.cuil || "").trim();
+  const identifier = normalizeIdentifier(req.params.cuil);
   let responded = false;
 
   const sendResponse = (status, data) => {
@@ -596,47 +726,54 @@ app.get("/api/clients/:cuil", async (req, res) => {
   };
 
   try {
-    console.log(`[/api/clients/:cuil] Procesando solicitud para CUIL: ${cuil}`);
-    const data = await fetchCoreApiData(cuil);
-    console.log(`[/api/clients/:cuil] Datos obtenidos exitosamente para CUIL: ${cuil}`);
+    if (!isValidIdentifier(identifier)) {
+      return sendResponse(400, { error: "CUIL inválido" });
+    }
+
+    console.log(`[/api/clients/:cuil] Resolviendo persona para identificador: ${identifier}`);
+    const resolved = await resolveCirenioPerson(identifier);
+    if (!resolved) {
+      return sendResponse(404, { error: "CUIL no encontrado" });
+    }
+
+    const data = await fetchCoreApiDataByUid(resolved.person.uid, identifier, resolved.person);
+    console.log(`[/api/clients/:cuil] Datos obtenidos exitosamente para identificador: ${identifier}`);
     return sendResponse(200, data);
   } catch (error) {
     if (responded) {
-      console.warn(`[/api/clients/:cuil] Intento de respuesta duplicada para CUIL: ${cuil}`);
+      console.warn(`[/api/clients/:cuil] Intento de respuesta duplicada para identificador: ${identifier}`);
       return;
     }
 
-    // Log detallado para debugging interno (no se expone al cliente)
-    console.error(`[/api/clients/:cuil] Error procesando solicitud para CUIL: ${cuil}`);
+    console.error(`[/api/clients/:cuil] Error procesando solicitud para identificador: ${identifier}`);
     console.error(`[/api/clients/:cuil] Error name: ${error.name}`);
     console.error(`[/api/clients/:cuil] Error message: ${error.message}`);
     if (error.stack) {
       console.error(`[/api/clients/:cuil] Stack trace:`, error.stack);
     }
 
-    // Solo exponer errores explícitamente contemplados en el contrato de la API
     if (error.message === "CUIL no encontrado") {
       return sendResponse(404, { error: error.message });
     }
 
-    // Todos los demás errores (técnicos, de infraestructura, runtime, etc.)
-    // se reemplazan por un mensaje genérico neutro
+    if (error.message === "MULTIPLE_PERSON_MATCHES") {
+      return sendResponse(409, {
+        error: "multiple_person_matches",
+        message: "No se pudo determinar una persona única para el DNI consultado."
+      });
+    }
+
     return sendResponse(500, { error: "Ocurrió un error inesperado. Intente nuevamente más tarde." });
   }
 });
 
 async function handleClienteMetricsRequest(req, res, { source }) {
-  const cuil = String(req.params.cuil || "").trim();
-
-  // In the future, this should call Cirenio Core (external integration).
-  // For now, we return the latest processed snapshot from our DB.
-  const [jobRows] = await db.query("SELECT id FROM jobs WHERE status = 'completed' ORDER BY id DESC LIMIT 1");
-  const latestJobId = jobRows?.[0]?.id;
-  if (!latestJobId) {
-    return res.status(404).json({ error: "No hay jobs completados" });
+  const identifier = normalizeIdentifier(req.params.cuil);
+  if (!isValidIdentifier(identifier)) {
+    return res.status(400).json({ error: "CUIL inválido" });
   }
 
-  const [rows] = await db.query("SELECT * FROM cuil_metrics WHERE job_id = ? AND cuil = ?", [latestJobId, cuil]);
+  const [rows] = await db.query("SELECT * FROM cuil_metrics WHERE cuil = ? ORDER BY job_id DESC LIMIT 1", [identifier]);
   const row = rows[0];
 
   if (!row) {

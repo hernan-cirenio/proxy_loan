@@ -76,17 +76,16 @@ function renderCuilResult(container, cuil, data) {
 }
 
 async function fetchCuil(cuil) {
-  const res = await fetch(`/api/clientes/${encodeURIComponent(cuil)}`, {
+  const res = await fetch(`/api/loan/clients/${encodeURIComponent(cuil)}`, {
     headers: { Accept: "application/json" }
   });
 
-  if (res.status === 404) {
-    return { ok: false, status: 404, error: "CUIL no encontrado" };
-  }
-
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    return { ok: false, status: res.status, error: text || `Error HTTP ${res.status}` };
+    const payload = await res.json().catch(() => null);
+    if (res.status === 404) {
+      return { ok: false, status: 404, error: payload?.error || "CUIL no encontrado" };
+    }
+    return { ok: false, status: res.status, error: payload?.message || payload?.error || `Error HTTP ${res.status}` };
   }
 
   const data = await res.json();

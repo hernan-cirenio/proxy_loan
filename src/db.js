@@ -67,7 +67,7 @@ export async function ensureSchema(db) {
   await db.query(`
     CREATE TABLE IF NOT EXISTS cuil_metrics (
       job_id BIGINT UNSIGNED NOT NULL,
-      cuil VARCHAR(32) NOT NULL,
+      cuil VARCHAR(11) NOT NULL,
       deuda_a_vencer_total_vigente DOUBLE NULL,
       suma_cuotas_prestamo_vigente DOUBLE NULL,
       suma_cuotas_prestamo_mes_1 DOUBLE NULL,
@@ -81,6 +81,22 @@ export async function ensureSchema(db) {
       PRIMARY KEY (job_id, cuil),
       INDEX idx_metrics_cuil_job (cuil, job_id),
       INDEX idx_metrics_updated_at (updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS cirenio_persons (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      uid CHAR(8) NOT NULL,
+      cuil CHAR(11) NOT NULL,
+      dni VARCHAR(11) NOT NULL,
+      gender CHAR(1) NULL,
+      created_at DATETIME(6) NOT NULL,
+      updated_at DATETIME(6) NOT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY ux_cirenio_persons_uid (uid),
+      UNIQUE KEY ux_cirenio_persons_cuil (cuil),
+      INDEX idx_cirenio_persons_dni (dni)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
@@ -121,5 +137,39 @@ export async function ensureSchema(db) {
     await db.query(`ALTER TABLE cuil_metrics MODIFY job_id BIGINT UNSIGNED NOT NULL`);
     await db.query(`ALTER TABLE cuil_metrics DROP PRIMARY KEY, ADD PRIMARY KEY (job_id, cuil)`);
     await db.query(`CREATE INDEX idx_metrics_cuil_job ON cuil_metrics (cuil, job_id)`);
+  }
+
+  const [cuilColumnRows] = await db.query(
+    `
+      SELECT CHARACTER_MAXIMUM_LENGTH AS max_len
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'cuil_metrics'
+        AND COLUMN_NAME = 'cuil'
+    `
+  );
+  const cuilMaxLength = Number(cuilColumnRows?.[0]?.max_len || 0);
+  if (cuilMaxLength > 11) {
+    await db.query(`ALTER TABLE cuil_metrics MODIFY cuil VARCHAR(11) NOT NULL`);
+  }
+
+  const [personsRows] = await db.query(
+    `
+      SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH AS max_len
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'cirenio_persons'
+        AND COLUMN_NAME IN ('uid', 'gender')
+    `
+  );
+  const uidMaxLength = Number(personsRows.find((row) => row.COLUMN_NAME === "uid")?.max_len || 0);
+  const genderMaxLength = Number(personsRows.find((row) => row.COLUMN_NAME === "gender")?.max_len || 0);
+
+  if (uidMaxLength !== 8) {
+    await db.query(`ALTER TABLE cirenio_persons MODIFY uid CHAR(8) NOT NULL`);
+  }
+
+  if (genderMaxLength !== 1) {
+    await db.query(`ALTER TABLE cirenio_persons MODIFY gender CHAR(1) NULL`);
   }
 }

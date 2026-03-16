@@ -102,6 +102,10 @@ def parse_date(value):
     return None
 
 
+def normalize_document(value):
+    return "".join(ch for ch in str(value or "").strip() if ch.isdigit())
+
+
 def month_key(dt_value):
     return dt_value.year, dt_value.month
 
@@ -122,7 +126,7 @@ def parse_convenios(path):
                 continue
             row = row + [""] * (len(header) - len(row))
             record = dict(zip(header, row))
-            cuil = record.get("NRO_ DOC", "").strip().strip("'\"")
+            cuil = normalize_document(record.get("NRO_ DOC", "").strip().strip("'\""))
             if not cuil:
                 continue
             data = results.setdefault(
@@ -184,7 +188,7 @@ def parse_detalle(path):
             if not row:
                 continue
             row = row + [""] * (len(header) - len(row))
-            cuil = row[idx_doc].strip() if idx_doc is not None else ""
+            cuil = normalize_document(row[idx_doc]) if idx_doc is not None else ""
             if cuil:
                 last_cuil = cuil
             else:
@@ -375,7 +379,7 @@ def ensure_schema(conn):
             """
             CREATE TABLE IF NOT EXISTS cuil_metrics (
               job_id BIGINT UNSIGNED NOT NULL,
-              cuil VARCHAR(32) NOT NULL,
+              cuil VARCHAR(11) NOT NULL,
               deuda_a_vencer_total_vigente DOUBLE NULL,
               suma_cuotas_prestamo_vigente DOUBLE NULL,
               suma_cuotas_prestamo_mes_1 DOUBLE NULL,
@@ -389,6 +393,23 @@ def ensure_schema(conn):
               PRIMARY KEY (job_id, cuil),
               INDEX idx_metrics_cuil_job (cuil, job_id),
               INDEX idx_metrics_updated_at (updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cirenio_persons (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+              uid CHAR(8) NOT NULL,
+              cuil CHAR(11) NOT NULL,
+              dni VARCHAR(11) NOT NULL,
+              gender CHAR(1) NULL,
+              created_at DATETIME(6) NOT NULL,
+              updated_at DATETIME(6) NOT NULL,
+              PRIMARY KEY (id),
+              UNIQUE KEY ux_cirenio_persons_uid (uid),
+              UNIQUE KEY ux_cirenio_persons_cuil (cuil),
+              INDEX idx_cirenio_persons_dni (dni)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """
         )

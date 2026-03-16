@@ -3,9 +3,9 @@
 Modulo para importar CSVs, recalcular variables por CUIL y exponer una API REST.
 
 ## Componentes
-- Node.js API + UI: carga de archivos, login y consulta `/api/clientes/:cuil`.
+- Node.js API + UI: carga de archivos, login y consulta de APIs `loan` y `core`.
 - Python importer: procesa jobs asincronos y recalcula el agregado.
-- SQLite: almacenamiento de jobs y variables agregadas.
+- MySQL: almacenamiento de jobs, métricas agregadas y catálogo de personas.
 
 ## Configuracion
 1. Crear `.env` desde `.env.example`.
@@ -44,9 +44,10 @@ Modulo para importar CSVs, recalcular variables por CUIL y exponer una API REST.
 ## Endpoints
 - UI: `GET /` (login requerido).
 - API health: `GET /api/health`.
-- API cliente: `GET /api/clientes/:cuil` (404 si no existe).
-- API core (mock): `GET /api/core/clientes/:cuil` (misma interfaz/payload que `/api/clientes/:cuil`).
+- API loan proxy: `GET /api/loan/clients/:identifier` (busca por el identificador documental cargado en lotes, normalmente DNI).
+- API core Cirenio: `GET /api/clients/:identifier` (primero busca en `cirenio_persons` por `cuil`; si no hay match, busca por `dni` y consulta el core por `uid`).
+- Alta catálogo core: `POST /api/core/persons` (requiere `API_KEY_CIRENIO`; body JSON con `cuil`, `dni`, `gender`/`genero` y `uid`).
 
 ## Notas
-- Cada importacion elimina los datos previos y recalcula todo.
+- `cuil_metrics` conserva histórico por `job_id`; cada consulta devuelve el snapshot más reciente para ese identificador.
 - Las formulas actuales son heuristicas. Cuando se definan las reglas finales, se ajustan en `worker/importer.py`.

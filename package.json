@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/start.js",
+    "start:prod": "NODE_ENV=production node src/server.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.744.0",
+    "dotenv": "^16.6.1",
     "express": "^4.21.2",
     "express-session": "^1.18.1",
     "multer": "^1.4.5-lts.1",
