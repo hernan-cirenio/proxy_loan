@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { ensureSchema, getDb } from "./db.js";
 
 const PORT = process.env.PORT || 3000;
@@ -32,6 +33,16 @@ const db = getDb();
 await ensureSchema(db);
 
 const upload = multer({ dest: LOCAL_STORAGE_DIR });
+
+function getKeyBase() {
+  const prefix = String(DO_SPACES_PREFIX || "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "")
+    .split("/")
+    .filter((p) => p && p !== "." && p !== "..")
+    .join("/");
+  return prefix ? `${prefix}/` : "";
+}
 
 function normalizeIdentifier(value) {
   return String(value ?? "").replace(/\D/g, "").trim();
@@ -326,6 +337,10 @@ function requireAuth(req, res, next) {
   if (req.session?.user === true) {
     return next();
   }
+  const wantsJson = Boolean(req.xhr) || req.accepts(["json", "html"]) === "json";
+  if (wantsJson) {
+    return res.status(401).json({ ok: false, error: "No autenticado" });
+  }
   return res.redirect("/login");
 }
 
@@ -370,6 +385,106 @@ app.get("/", requireAuth, (req, res) => {
   });
 });
 
+app.post("/uploads/init", requireAuth, async (req, res) => {
+  if (LOCAL_STORAGE) {
+    return res.status(400).json({ ok: false, error: "Uploads directos requieren DO Spaces (LOCAL_STORAGE=false)" });
+  }
+
+  const detalle = req.body?.detalle || null;
+  const convenios = req.body?.convenios || null;
+
+  const safe = (f) => ({
+    name: String(f?.name || "").slice(0, 255),
+    size: Number(f?.size || 0),
+    type: String(f?.type || "")
+  });
+
+  const d = safe(detalle);
+  const c = safe(convenios);
+
+  if (!d.name || !c.name || !Number.isFinite(d.size) || !Number.isFinite(c.size) || d.size <= 0 || c.size <= 0) {
+    return res.status(400).json({ ok: false, error: "Metadata de archivos inválida" });
+  }
+
+  const now = new Date();
+  const [insertRes] = await db.query(
+    "INSERT INTO jobs (created_at, status, detalle_name, convenios_name) VALUES (?, ?, ?, ?)",
+    [now, "pending_upload", d.name, c.name]
+  );
+  const jobId = insertRes.insertId;
+
+  try {
+    const s3 = createS3Client();
+    const keyBase = getKeyBase();
+    const detalleKey = `${keyBase}imports/${jobId}/detalle.csv`;
+    const conveniosKey = `${keyBase}imports/${jobId}/convenios.csv`;
+
+    // Avoid signing content-type to prevent mismatches across browsers.
+    const expiresIn = 60 * 30; // 30 minutes
+    const detalleUrl = await getSignedUrl(
+      s3,
+      new PutObjectCommand({
+        Bucket: DO_SPACES_BUCKET,
+        Key: detalleKey
+      }),
+      { expiresIn }
+    );
+    const conveniosUrl = await getSignedUrl(
+      s3,
+      new PutObjectCommand({
+        Bucket: DO_SPACES_BUCKET,
+        Key: conveniosKey
+      }),
+      { expiresIn }
+    );
+
+    return res.json({
+      ok: true,
+      jobId,
+      uploads: {
+        detalle: { key: detalleKey, url: detalleUrl, method: "PUT" },
+        convenios: { key: conveniosKey, url: conveniosUrl, method: "PUT" }
+      }
+    });
+  } catch (error) {
+    await db.query("UPDATE jobs SET status = ?, message = ? WHERE id = ?", ["failed", error.message, jobId]);
+    return res.status(500).json({ ok: false, error: error.message || "Error generando URL firmada" });
+  }
+});
+
+app.post("/uploads/complete", requireAuth, async (req, res) => {
+  if (LOCAL_STORAGE) {
+    return res.status(400).json({ ok: false, error: "Uploads directos requieren DO Spaces (LOCAL_STORAGE=false)" });
+  }
+
+  const jobId = Number(req.body?.jobId);
+  if (!Number.isFinite(jobId) || jobId <= 0) {
+    return res.status(400).json({ ok: false, error: "jobId inválido" });
+  }
+
+  try {
+    const keyBase = getKeyBase();
+    const detalleKey = `${keyBase}imports/${jobId}/detalle.csv`;
+    const conveniosKey = `${keyBase}imports/${jobId}/convenios.csv`;
+
+    await db.query("UPDATE jobs SET status = ?, detalle_key = ?, convenios_key = ? WHERE id = ?", [
+      "uploaded",
+      detalleKey,
+      conveniosKey,
+      jobId
+    ]);
+
+    if (INLINE_PROCESS) {
+      runInlineWorker();
+    }
+
+    return res.json({ ok: true, jobId });
+  } catch (error) {
+    await db.query("UPDATE jobs SET status = ?, message = ? WHERE id = ?", ["failed", error.message, jobId]);
+    return res.status(500).json({ ok: false, error: error.message || "Error completando upload" });
+  }
+});
+
 app.post(
   "/upload",
   requireAuth,
@@ -402,13 +517,7 @@ app.post(
     const jobId = insertRes.insertId;
 
     try {
-      const prefix = String(DO_SPACES_PREFIX || "")
-        .replace(/\\/g, "/")
-        .replace(/^\/+|\/+$/g, "")
-        .split("/")
-        .filter((p) => p && p !== "." && p !== "..")
-        .join("/");
-      const keyBase = prefix ? `${prefix}/` : "";
+      const keyBase = getKeyBase();
 
       if (LOCAL_STORAGE) {
         const detalleKey = path.join(keyBase, "imports", String(jobId), "detalle.csv");
