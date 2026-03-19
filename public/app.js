@@ -143,6 +143,8 @@ function setupUploadWithProgress() {
   const textEl = document.getElementById("upload-progress-text");
   const bar = progress?.querySelector('[role="progressbar"]');
   const logoutBtn = document.getElementById("logout-button");
+  const detalleInput = form?.querySelector('input[name="detalle"]');
+  const conveniosInput = form?.querySelector('input[name="convenios"]');
 
   if (!form || !progress || !fill || !percentEl || !textEl || !bar) return;
 
@@ -174,53 +176,162 @@ function setupUploadWithProgress() {
     if (label) textEl.textContent = label;
   };
 
+  const putWithProgress = (url, file, { label, onProgress }) =>
+    new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", url, true);
+
+      // Do not set Content-Type if browser couldn't infer it; avoid triggering CORS preflight issues unnecessarily.
+      const contentType = file?.type || "text/csv";
+      xhr.setRequestHeader("Content-Type", contentType);
+
+      xhr.upload.onprogress = (ev) => {
+        if (!ev.lengthComputable) {
+          if (onProgress) onProgress(0);
+          updateProgress(0, label || "Subiendo…");
+          return;
+        }
+        if (onProgress) onProgress(ev.loaded);
+      };
+
+      xhr.onerror = () => reject(new Error("Error de red durante la carga"));
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) return resolve();
+        return reject(new Error(`Error subiendo a storage (HTTP ${xhr.status})`));
+      };
+
+      xhr.send(file);
+    });
+
+  const postJson = async (url, body) => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body)
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(payload?.error || `Error HTTP ${res.status}`);
+    }
+    return payload;
+  };
+
+  const uploadViaProxy = () =>
+    new Promise((resolve, reject) => {
+      const fd = new FormData(form);
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", form.getAttribute("action") || "/upload", true);
+      xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+      xhr.setRequestHeader("Accept", "application/json");
+
+      xhr.upload.onprogress = (ev) => {
+        if (!ev.lengthComputable) {
+          updateProgress(0, "Subiendo…");
+          return;
+        }
+        const pct = (ev.loaded / ev.total) * 100;
+        updateProgress(pct, "Subiendo archivos…");
+      };
+
+      xhr.onerror = () => reject(new Error("Error de red durante la carga"));
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) return resolve();
+        let msg = `Error HTTP ${xhr.status}`;
+        try {
+          const parsed = JSON.parse(xhr.responseText || "{}");
+          msg = parsed?.error || msg;
+        } catch {
+          // ignore
+        }
+        return reject(new Error(msg));
+      };
+
+      xhr.send(fd);
+    });
+
   form.addEventListener("submit", (e) => {
     if (uploading) return;
     e.preventDefault();
 
-    const fd = new FormData(form);
+    const detalleFile = detalleInput?.files?.[0] || null;
+    const conveniosFile = conveniosInput?.files?.[0] || null;
+    if (!detalleFile || !conveniosFile) {
+      progress.hidden = false;
+      updateProgress(0, "Faltan archivos");
+      return;
+    }
+
     progress.hidden = false;
     updateProgress(0, "Preparando carga…");
     setUploading(true);
 
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", form.getAttribute("action") || "/upload", true);
-    xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
-    xhr.setRequestHeader("Accept", "application/json");
+    (async () => {
+      try {
+        const totalBytes = (detalleFile.size || 0) + (conveniosFile.size || 0);
 
-    xhr.upload.onprogress = (ev) => {
-      if (!ev.lengthComputable) {
-        updateProgress(0, "Subiendo…");
-        return;
-      }
-      const pct = (ev.loaded / ev.total) * 100;
-      updateProgress(pct, "Subiendo archivos…");
-    };
+        let init;
+        try {
+          updateProgress(1, "Solicitando URL de carga…");
+          init = await postJson("/uploads/init", {
+            detalle: { name: detalleFile.name, size: detalleFile.size, type: detalleFile.type },
+            convenios: { name: conveniosFile.name, size: conveniosFile.size, type: conveniosFile.type }
+          });
+        } catch (err) {
+          // Fallback to proxy upload only for small totals to avoid 413 loops on big files.
+          const maxFallbackBytes = 50 * 1024 * 1024;
+          if (totalBytes > 0 && totalBytes <= maxFallbackBytes) {
+            updateProgress(1, "Iniciando carga alternativa…");
+            await uploadViaProxy();
+            updateProgress(100, "Carga completa. Procesando…");
+            window.location.href = "/?message=ok";
+            return;
+          }
+          throw err;
+        }
 
-    xhr.onerror = () => {
-      setUploading(false);
-      updateProgress(0, "Error de red durante la carga");
-    };
+        const jobId = init?.jobId;
+        const detalleUrl = init?.uploads?.detalle?.url;
+        const conveniosUrl = init?.uploads?.convenios?.url;
+        if (!jobId || !detalleUrl || !conveniosUrl) {
+          throw new Error("Respuesta inválida del servidor (init)");
+        }
 
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
+        const loaded = { detalle: 0, convenios: 0 };
+        const report = (label) => {
+          const sum = loaded.detalle + loaded.convenios;
+          const pct = totalBytes > 0 ? (sum / totalBytes) * 100 : 0;
+          updateProgress(pct, label);
+        };
+
+        report("Subiendo Detalle…");
+        await putWithProgress(detalleUrl, detalleFile, {
+          label: "Subiendo Detalle…",
+          onProgress: (bytes) => {
+            loaded.detalle = bytes;
+            report("Subiendo Detalle…");
+          }
+        });
+        loaded.detalle = detalleFile.size || loaded.detalle;
+        report("Subiendo Convenios…");
+
+        await putWithProgress(conveniosUrl, conveniosFile, {
+          label: "Subiendo Convenios…",
+          onProgress: (bytes) => {
+            loaded.convenios = bytes;
+            report("Subiendo Convenios…");
+          }
+        });
+        loaded.convenios = conveniosFile.size || loaded.convenios;
+        report("Finalizando…");
+
+        await postJson("/uploads/complete", { jobId });
         updateProgress(100, "Carga completa. Procesando…");
         window.location.href = "/?message=ok";
-        return;
+      } catch (err) {
+        setUploading(false);
+        updateProgress(0, err?.message || "Error durante la carga");
       }
-
-      let msg = `Error HTTP ${xhr.status}`;
-      try {
-        const parsed = JSON.parse(xhr.responseText || "{}");
-        msg = parsed?.error || msg;
-      } catch {
-        // ignore
-      }
-      setUploading(false);
-      updateProgress(0, msg);
-    };
-
-    xhr.send(fd);
+    })();
   });
 }
 
