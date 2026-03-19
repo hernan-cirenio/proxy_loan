@@ -420,7 +420,8 @@ app.post("/uploads/init", requireAuth, async (req, res) => {
     const conveniosKey = `${keyBase}imports/${jobId}/convenios.csv`;
 
     // Avoid signing content-type to prevent mismatches across browsers.
-    const expiresIn = 60 * 30; // 30 minutes
+    // Large uploads can take a while on slow networks; keep URLs valid long enough.
+    const expiresIn = 60 * 60 * 2; // 2 hours
     const detalleUrl = await getSignedUrl(
       s3,
       new PutObjectCommand({
