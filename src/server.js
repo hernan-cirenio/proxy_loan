@@ -840,13 +840,10 @@ app.get("/api/clients/:cuil", async (req, res) => {
       return sendResponse(400, { error: "CUIL inválido" });
     }
 
-    console.log(`[/api/clients/:cuil] Resolviendo persona para identificador: ${identifier}`);
-    const resolved = await resolveCirenioPerson(identifier);
-    if (!resolved) {
+    const data = await getCirenioCoreDataByIdentifier(identifier, { allowMissingCatalog: false, allowMissingCore: false });
+    if (!data) {
       return sendResponse(404, { error: "CUIL no encontrado" });
     }
-
-    const data = await fetchCoreApiDataByUid(resolved.person.uid, identifier, resolved.person);
     console.log(`[/api/clients/:cuil] Datos obtenidos exitosamente para identificador: ${identifier}`);
     return sendResponse(200, data);
   } catch (error) {
@@ -877,28 +874,116 @@ app.get("/api/clients/:cuil", async (req, res) => {
   }
 });
 
+function buildLoanMetricsResponse(row, { source } = {}) {
+  // Do not expose internal job_id in the public API response.
+  // eslint-disable-next-line no-unused-vars
+  const { job_id: _jobId, ...publicRow } = row;
+  const response = {
+    ...publicRow,
+    updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null
+  };
+
+  if (source) {
+    response.source = source;
+  }
+
+  return response;
+}
+
+function stripCombinedSourceFields(payload) {
+  if (!payload || typeof payload !== "object") {
+    return payload;
+  }
+
+  const { cuil: _cuil, source: _source, ...rest } = payload;
+  return rest;
+}
+
+async function getLoanMetricsByIdentifier(identifier, { source } = {}) {
+  const [rows] = await db.query("SELECT * FROM cuil_metrics WHERE cuil = ? ORDER BY job_id DESC LIMIT 1", [identifier]);
+  const row = rows[0];
+
+  if (!row) {
+    return null;
+  }
+
+  return buildLoanMetricsResponse(row, { source });
+}
+
+async function getCirenioCoreDataByIdentifier(identifier, { allowMissingCatalog = false, allowMissingCore = false } = {}) {
+  console.log(`[getCirenioCoreDataByIdentifier] Resolviendo persona para identificador: ${identifier}`);
+  const resolved = await resolveCirenioPerson(identifier);
+
+  if (!resolved) {
+    if (allowMissingCatalog) {
+      return null;
+    }
+    throw new Error("CUIL no encontrado");
+  }
+
+  try {
+    return await fetchCoreApiDataByUid(resolved.person.uid, identifier, resolved.person);
+  } catch (error) {
+    if (allowMissingCore && error.message === "CUIL no encontrado") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+app.get("/api/combined/clients/:cuil", async (req, res) => {
+  const identifier = normalizeIdentifier(req.params.cuil);
+  if (!isValidIdentifier(identifier)) {
+    return res.status(400).json({ error: "CUIL inválido" });
+  }
+
+  try {
+    const loanData = await getLoanMetricsByIdentifier(identifier);
+    if (!loanData) {
+      return res.status(404).json({ error: "CUIL no encontrado" });
+    }
+
+    const cirenioData = await getCirenioCoreDataByIdentifier(identifier, {
+      allowMissingCatalog: true,
+      allowMissingCore: true
+    });
+
+    return res.json({
+      cuil: identifier,
+      cirenio: stripCombinedSourceFields(cirenioData),
+      loan: stripCombinedSourceFields(loanData)
+    });
+  } catch (error) {
+    if (error.message === "MULTIPLE_PERSON_MATCHES") {
+      return res.status(409).json({
+        error: "multiple_person_matches",
+        message: "No se pudo determinar una persona única para el DNI consultado."
+      });
+    }
+
+    console.error(`[/api/combined/clients/:cuil] Error procesando solicitud para identificador: ${identifier}`);
+    console.error(`[/api/combined/clients/:cuil] Error name: ${error.name}`);
+    console.error(`[/api/combined/clients/:cuil] Error message: ${error.message}`);
+    if (error.stack) {
+      console.error(`[/api/combined/clients/:cuil] Stack trace:`, error.stack);
+    }
+
+    return res.status(500).json({ error: "Ocurrió un error inesperado. Intente nuevamente más tarde." });
+  }
+});
+
 async function handleClienteMetricsRequest(req, res, { source }) {
   const identifier = normalizeIdentifier(req.params.cuil);
   if (!isValidIdentifier(identifier)) {
     return res.status(400).json({ error: "CUIL inválido" });
   }
 
-  const [rows] = await db.query("SELECT * FROM cuil_metrics WHERE cuil = ? ORDER BY job_id DESC LIMIT 1", [identifier]);
-  const row = rows[0];
-
-  if (!row) {
+  const data = await getLoanMetricsByIdentifier(identifier, { source });
+  if (!data) {
     return res.status(404).json({ error: "CUIL no encontrado" });
   }
 
-  // Do not expose internal job_id in the public API response.
-  // eslint-disable-next-line no-unused-vars
-  const { job_id: _jobId, ...publicRow } = row;
-
-  return res.json({
-    ...publicRow,
-    updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
-    source
-  });
+  return res.json(data);
 }
 
 app.get("/api/health", (req, res) => {
