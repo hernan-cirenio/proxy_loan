@@ -52,6 +52,20 @@ function isValidIdentifier(value) {
   return /^[0-9]{1,11}$/.test(String(value ?? ""));
 }
 
+function isValidCuil(value) {
+  return /^[0-9]{11}$/.test(String(value ?? ""));
+}
+
+function extractDniFromCuil(value) {
+  const cuil = normalizeIdentifier(value);
+  if (!isValidCuil(cuil)) {
+    return null;
+  }
+
+  // Argentinian CUIL structure: XX + DNI + X
+  return cuil.slice(2, -1);
+}
+
 function requireApiAuth(req, res, next) {
   // Allow authenticated UI sessions to use /api/* without exposing the API key to the browser.
   if (req.session?.user === true) {
@@ -932,24 +946,27 @@ async function getCirenioCoreDataByIdentifier(identifier, { allowMissingCatalog 
 }
 
 app.get("/api/combined/clients/:cuil", async (req, res) => {
-  const identifier = normalizeIdentifier(req.params.cuil);
-  if (!isValidIdentifier(identifier)) {
+  const cuil = normalizeIdentifier(req.params.cuil);
+  if (!isValidCuil(cuil)) {
     return res.status(400).json({ error: "CUIL inválido" });
   }
 
   try {
-    const loanData = await getLoanMetricsByIdentifier(identifier);
-    if (!loanData) {
+    const loanLookupIdentifier = extractDniFromCuil(cuil);
+    const [loanData, cirenioData] = await Promise.all([
+      getLoanMetricsByIdentifier(loanLookupIdentifier),
+      getCirenioCoreDataByIdentifier(cuil, {
+        allowMissingCatalog: true,
+        allowMissingCore: true
+      })
+    ]);
+
+    if (!loanData && !cirenioData) {
       return res.status(404).json({ error: "CUIL no encontrado" });
     }
 
-    const cirenioData = await getCirenioCoreDataByIdentifier(identifier, {
-      allowMissingCatalog: true,
-      allowMissingCore: true
-    });
-
     return res.json({
-      cuil: identifier,
+      cuil,
       cirenio: stripCombinedSourceFields(cirenioData),
       loan: stripCombinedSourceFields(loanData)
     });
@@ -961,7 +978,7 @@ app.get("/api/combined/clients/:cuil", async (req, res) => {
       });
     }
 
-    console.error(`[/api/combined/clients/:cuil] Error procesando solicitud para identificador: ${identifier}`);
+    console.error(`[/api/combined/clients/:cuil] Error procesando solicitud para identificador: ${cuil}`);
     console.error(`[/api/combined/clients/:cuil] Error name: ${error.name}`);
     console.error(`[/api/combined/clients/:cuil] Error message: ${error.message}`);
     if (error.stack) {
